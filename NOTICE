@@ -1,0 +1,22 @@
+Arx Notes :crypto
+Copyright 2026 Arx Secretorum
+
+This product includes software developed by Arx Secretorum.
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+
+This product depends on the following third-party software, used under the
+terms of its own license:
+
+  Bouncy Castle Cryptography APIs (bcprov-jdk18on)
+  Copyright (c) 2000-2025 The Legion of the Bouncy Castle Inc.
+  (https://www.bouncycastle.org)
+  Licensed under the Bouncy Castle License (an adaptation of the MIT X11
+  License), which is compatible with the Apache License, Version 2.0.
+
+  Bouncy Castle provides the Argon2id key-derivation function used for
+  password-based backup encryption and for hashing the lock PIN.
