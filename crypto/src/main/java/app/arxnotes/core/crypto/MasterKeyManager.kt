@@ -21,9 +21,11 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
+import android.security.keystore.UserNotAuthenticatedException
 import java.io.File
 import java.security.KeyStore
 import java.security.SecureRandom
+import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 
@@ -43,6 +45,14 @@ class DeviceLockedException : Exception("Device is locked; DB key unavailable")
 
 /** Keystore аннулировал ключ-обёртку (смена учётных данных экрана/перенос устройства) → мастер-секрет и данные невосстановимы. НЕ порча блоба. */
 class KeyInvalidatedException : Exception("Keystore wrap key permanently invalidated; data unrecoverable")
+
+/**
+ * Android Keystore на этом устройстве не даёт использовать ключ-обёртку даже БЕЗ привязки к
+ * разблокировке: `Cipher.init` кидает `UserNotAuthenticatedException` для любого свежесозданного
+ * ключа (особенности Keymaster части прошивок, напр. отдельные MagicOS/HarmonyOS-сборки).
+ * Проброс — чтобы показать пользователю понятную ошибку, а не молчаливый серый экран.
+ */
+class KeystoreUnusableException : Exception("Android Keystore cannot perform crypto on this device")
 
 /**
  * Выполняет [block]; единственное преобразование — аннулированный Keystore-ключ
@@ -79,12 +89,72 @@ class MasterKeyManager(private val context: Context) {
 
     /** Возвращает мастер-секрет, создавая и сохраняя его при первом вызове. */
     private fun getOrCreateMaster(): ByteArray {
-        ensureKeystoreKey()
-        return if (blobFile.exists()) decryptBlob() else createAndStoreMaster()
+        // Мастер-секрет уже сохранён → ключ-обёртка когда-то успешно работал. Путь чтения.
+        if (blobFile.exists()) {
+            return try {
+                decryptBlob()
+            } catch (e: UserNotAuthenticatedException) {
+                // Ключ рабочий, но устройство СЕЙЧАС заблокировано (setUnlockedDeviceRequired) →
+                // транзиентно: покажем «замок»/повторим позже, это НЕ порча данных.
+                throw DeviceLockedException()
+            }
+        }
+        // Первый запуск: подбираем конфигурацию ключа-обёртки, ПРОВЕРЕННУЮ реальной операцией
+        // шифрования, и только потом создаём мастер-секрет уже гарантированно рабочим ключом.
+        prepareWorkingWrapKey()
+        return createAndStoreMaster()
     }
 
-    private fun ensureKeystoreKey() {
-        if (keyStore.containsAlias(KEY_ALIAS)) return
+    /**
+     * Гарантирует, что в Keystore лежит ключ-обёртка, которым НА ЭТОМ устройстве реально можно
+     * шифровать. Часть прошивок (Ulefone, отдельные Honor/MagicOS-сборки и др.) кидает
+     * `UserNotAuthenticatedException` при `Cipher.init` даже на разблокированном устройстве —
+     * иногда из-за `setUnlockedDeviceRequired`, иногда для любого свежесозданного ключа. Поэтому
+     * НЕ «надеемся», что первая попытка сработала, а ПРОВЕРЯЕМ пробным шифрованием и берём
+     * конфигурацию, которая действительно работает.
+     */
+    private fun prepareWorkingWrapKey() {
+        // 1) С привязкой к разблокировке (если есть защищённый экран) — предпочтительно по безопасности.
+        recreateWrapKey(requireUnlocked = deviceIsSecure())
+        if (wrapKeyWorks()) return
+        // 2) Флаг делает ключ непригодным на этой прошивке → пересоздаём БЕЗ него и снова проверяем.
+        recreateWrapKey(requireUnlocked = false)
+        if (wrapKeyWorks()) return
+        // 3) Keystore недоступен даже без флага → не молчим (иначе серый экран): явный сигнал вызывающему.
+        if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
+        throw KeystoreUnusableException()
+    }
+
+    /**
+     * Удаляет старый ключ-обёртку (если был) и создаёт новый. `keyStore.load(null)` в конце
+     * ПЕРЕЧИТЫВАЕТ хранилище: часть прошивок не видит только что созданный ключ старым снимком
+     * KeyStore, из-за чего `secretKey()` возвращал бы удалённый ключ. Это устраняет «залипание»
+     * на прежней конфигурации при пересоздании.
+     */
+    private fun recreateWrapKey(requireUnlocked: Boolean) {
+        if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
+        createKeystoreKey(requireUnlocked)
+        keyStore.load(null)
+    }
+
+    /** Пробное шифрование: подтверждает, что ключ-обёртку РЕАЛЬНО можно использовать на этом устройстве. */
+    private fun wrapKeyWorks(): Boolean =
+        try {
+            // Та же трансформация, что и в AeadBlob.seal — только init, без doFinal (без побочных эффектов).
+            Cipher.getInstance("AES/GCM/NoPadding").init(Cipher.ENCRYPT_MODE, secretKey())
+            true
+        } catch (e: UserNotAuthenticatedException) {
+            false
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            false
+        }
+
+    /** Есть ли на устройстве защищённый экран блокировки (PIN/пароль/паттерн). */
+    private fun deviceIsSecure(): Boolean =
+        context.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true
+
+    /** Создаёт ключ-обёртку AES-256-GCM в Keystore. [requireUnlocked] — привязать к разблокировке. */
+    private fun createKeystoreKey(requireUnlocked: Boolean) {
         val builder = KeyGenParameterSpec.Builder(
             KEY_ALIAS,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
@@ -92,11 +162,11 @@ class MasterKeyManager(private val context: Context) {
             .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
             .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
             .setKeySize(256)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && requireUnlocked) {
             // Ключ-обёртку нельзя использовать, пока устройство заблокировано → защита от
             // извлечения БД на заблокированном (но включённом) телефоне. Напоминания берут
             // текст из интента (не из БД), а виджет под замком показывает «замок» (ArxNotesWidget),
-            // поэтому функциональность не страдает. На устройстве без блокировки — no-op.
+            // поэтому функциональность не страдает.
             builder.setUnlockedDeviceRequired(true)
         }
         KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE).apply {
