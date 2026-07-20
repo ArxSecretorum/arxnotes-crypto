@@ -23,6 +23,7 @@ import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.security.keystore.UserNotAuthenticatedException
 import java.io.File
+import java.security.InvalidKeyException
 import java.security.KeyStore
 import java.security.SecureRandom
 import javax.crypto.Cipher
@@ -106,10 +107,29 @@ class MasterKeyManager(private val context: Context) {
                 throw DeviceLockedException()
             }
         }
+        // Под замком устройства ключи с привязкой к разблокировке неработоспособны, а
+        // СИГНАТУРА ошибки зависит от прошивки: UserNotAuthenticatedException на одних
+        // (Ulefone/Honor), InvalidKeyException(KeyStoreException DEVICE_LOCKED) на
+        // keystore2-устройствах (наблюдалось на Vivo). Не диагностируем зоопарк — под
+        // замком первый запуск невозможен по определению: единый DeviceLockedException,
+        // вызывающий повторит после разблокировки.
+        if (isDeviceLocked()) throw DeviceLockedException()
         // Первый запуск: подбираем конфигурацию ключа-обёртки, ПРОВЕРЕННУЮ реальной операцией
         // шифрования, и только потом создаём мастер-секрет уже гарантированно рабочим ключом.
-        prepareWorkingWrapKey()
-        return createAndStoreMaster()
+        return try {
+            prepareWorkingWrapKey()
+            createAndStoreMaster()
+        } catch (e: DeviceLockedException) {
+            throw e
+        } catch (e: KeystoreUnusableException) {
+            throw e
+        } catch (e: Exception) {
+            // Устройство заблокировали МЕЖДУ проверкой выше и записью мастера (гонка с
+            // экраном блокировки): любое исключение здесь трактуем как транзиентную
+            // блокировку, если замок фактически опущен. Иначе — честно пробрасываем.
+            if (isDeviceLocked()) throw DeviceLockedException()
+            throw e
+        }
     }
 
     /**
@@ -154,9 +174,10 @@ class MasterKeyManager(private val context: Context) {
             // Та же трансформация, что и в AeadBlob.seal — только init, без doFinal (без побочных эффектов).
             Cipher.getInstance("AES/GCM/NoPadding").init(Cipher.ENCRYPT_MODE, secretKey())
             true
-        } catch (e: UserNotAuthenticatedException) {
-            false
-        } catch (e: KeyPermanentlyInvalidatedException) {
+        } catch (e: InvalidKeyException) {
+            // Покрывает весь зоопарк «ключ непригоден»: UserNotAuthenticatedException и
+            // KeyPermanentlyInvalidatedException — её подклассы, а keystore2-устройства
+            // кидают «голый» InvalidKeyException(KeyStoreException DEVICE_LOCKED).
             false
         }
 
